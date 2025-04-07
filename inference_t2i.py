@@ -136,6 +136,9 @@ if __name__ == '__main__':
         else:
             mask_schedule = get_mask_chedule(config.training.get("mask_schedule", "cosine"))
 
+        # Enable intermediate state storage for animation
+        model.store_intermediate_states = True
+        
         with torch.no_grad():
             gen_token_ids = model.t2i_generate(
                 input_ids=input_ids,
@@ -243,6 +246,9 @@ if __name__ == '__main__':
             else:
                 mask_schedule = get_mask_chedule(config.training.get("mask_schedule", "cosine"))
 
+            # Enable intermediate state storage for animation
+            model.store_intermediate_states = True
+            
             with torch.no_grad():
                 gen_token_ids = model.t2i_generate(
                     input_ids=input_ids,
@@ -284,8 +290,11 @@ if __name__ == '__main__':
         wandb.log({"generated_images": wandb_images}, step=0)
 
     elif config.mode == 't2i':
-        with open(config.dataset.params.validation_prompts_file, "r") as f:
-            validation_prompts = f.read().splitlines()
+        if config.prompt is not None:
+            validation_prompts = [config.prompt] * config.training.batch_size
+        else:
+            with open(config.dataset.params.validation_prompts_file, "r") as f:
+                validation_prompts = f.read().splitlines()
 
         for step in tqdm(range(0, len(validation_prompts), config.training.batch_size)):
             prompts = validation_prompts[step:step + config.training.batch_size]
@@ -317,6 +326,9 @@ if __name__ == '__main__':
             else:
                 mask_schedule = get_mask_chedule(config.training.get("mask_schedule", "cosine"))
 
+            # Enable intermediate state storage for animation
+            model.store_intermediate_states = True
+            
             with torch.no_grad():
                 gen_token_ids = model.t2i_generate(
                     input_ids=input_ids,
@@ -342,3 +354,67 @@ if __name__ == '__main__':
 
             wandb_images = [wandb.Image(image, caption=prompts[i]) for i, image in enumerate(pil_images)]
             wandb.log({"generated_images": wandb_images}, step=step)
+
+        # Create GIF from intermediate states
+        if hasattr(model, 'intermediate_states') and model.intermediate_states:
+            import imageio
+            import os
+            
+            # Create directory for saving GIFs if it doesn't exist
+            os.makedirs("diffusion_animations", exist_ok=True)
+            
+            for batch_idx in range(min(config.training.batch_size, len(prompts))):
+                frames = []
+                
+                # Process each intermediate state
+                for state_idx, state in enumerate(model.intermediate_states):
+                    tokens = state[batch_idx]
+                    
+                    # Create a mask to identify which tokens are masked
+                    mask = tokens == mask_token_id
+                    
+                    # Replace masked tokens with a valid token (0) for decoding
+                    tokens = torch.where(mask, torch.zeros_like(tokens), tokens)
+                    tokens = torch.clamp(tokens, max=config.model.showo.codebook_size - 1, min=0)
+                    
+                    # Reshape for decoding
+                    tokens = tokens.reshape(1, -1)
+                    
+                    # Decode the tokens to an image
+                    img = vq_model.decode_code(tokens)
+                    img = torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
+                    
+                    # Convert to numpy for easier manipulation
+                    img_np = img.permute(0, 2, 3, 1).cpu().numpy()[0]
+                    
+                    # Expand the mask to the image dimensions
+                    # First, reshape the mask to match the token grid
+                    h = w = int(np.sqrt(mask.numel()))
+                    mask_2d = mask.reshape(h, w)
+                    
+                    # Upscale mask to match image dimensions
+                    scale_factor = img_np.shape[0] // h
+                    mask_upscaled = mask_2d.repeat_interleave(scale_factor, dim=0).repeat_interleave(scale_factor, dim=1)
+                    mask_upscaled = mask_upscaled.cpu().numpy()
+                    
+                    # Apply the mask - set masked areas to black
+                    for c in range(3):  # RGB channels
+                        img_np[..., c][mask_upscaled] = 0.0
+                    
+                    # Scale for 8-bit image
+                    img_np *= 255.0
+                    img_np = img_np.astype(np.uint8)
+                    frames.append(img_np)
+                
+                # Add the final result if available
+                if batch_idx < len(images):
+                    frames.append(images[batch_idx])
+                
+                # Save the GIF
+                prompt_text = prompts[batch_idx].replace(" ", "_").replace("/", "_")[:50]  # Clean up filename
+                gif_path = f"diffusion_animations/diffusion_{prompt_text}_{batch_idx}.gif"
+                imageio.mimsave(gif_path, frames, duration=200, loop=0)
+                print(f"Saved diffusion animation to {gif_path}")
+            
+            # Clear the intermediate states to free memory
+            model.intermediate_states = []

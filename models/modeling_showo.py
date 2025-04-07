@@ -238,3 +238,119 @@ class Showo(ModelMixin, ConfigMixin):
                 break
 
         return result
+
+    def edit_generate(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        config,
+        guidance_scale: float = 3.0,
+        timesteps: int = 100,
+        temperature: float = 1.0,
+        noise_schedule: callable = cosine_schedule,
+        generator: torch.Generator = None,
+    ):
+        """
+        Generate edited image tokens by iteratively refining the input sequence.
+        
+        Args:
+            input_ids (torch.LongTensor): Input sequence with text, source image, and masked edited image tokens.
+            attention_mask (torch.Tensor): Attention mask for the sequence.
+            config: Configuration object containing model parameters.
+            guidance_scale (float): Scale for classifier-free guidance (not implemented here).
+            timesteps (int): Number of generation steps.
+            temperature (float): Sampling temperature.
+            noise_schedule (callable): Function to compute mask ratio (e.g., cosine_schedule).
+            generator (torch.Generator): Random number generator for reproducibility.
+        
+        Returns:
+            torch.LongTensor: Full generated sequence with edited image tokens filled in.
+        """
+        mask_token_id = self.mask_token_id
+        num_vq_tokens = config.model.showo.num_vq_tokens
+        llm_vocab_size = config.model.showo.llm_vocab_size
+        num_new_special_tokens = config.model.showo.num_new_special_tokens
+        codebook_size = config.model.showo.codebook_size
+
+        # Define the slice for edited image tokens: between second <|soi|> and second <|eoi|>
+        edited_image_slice = slice(-(num_vq_tokens + 1), -1)
+
+        # Clone the edited image tokens and adjust to 0-based indices for sampling
+        edited_image_tokens = input_ids[:, edited_image_slice].clone()
+        edited_image_tokens = torch.where(
+            edited_image_tokens == mask_token_id,
+            mask_token_id,
+            edited_image_tokens - llm_vocab_size - num_new_special_tokens
+        )
+
+        for step in range(timesteps):
+            # Update input_ids with current edited image tokens
+            input_ids[:, edited_image_slice] = torch.where(
+                edited_image_tokens == mask_token_id,
+                mask_token_id,
+                edited_image_tokens + llm_vocab_size + num_new_special_tokens
+            )
+
+            # Get model logits
+            logits = self(input_ids, attention_mask=attention_mask)
+
+            # Extract logits for edited image positions, focusing on image token vocabulary
+            logits_edited = logits[:, edited_image_slice, llm_vocab_size + num_new_special_tokens : llm_vocab_size + num_new_special_tokens + codebook_size]
+
+            # Sample from logits
+            probs = F.softmax(logits_edited / temperature, dim=-1)
+            # Sample indices relative to the codebook (0 to codebook_size-1)
+            sampled_ids_raw = torch.multinomial(probs.view(-1, probs.size(-1)), 1, generator=generator).view(probs.shape[:2])
+
+            # Preserve known tokens and update masked ones
+            unknown_map = edited_image_tokens == mask_token_id
+            # Create the final set of sampled_ids, potentially including original tokens or mask_token_id
+            sampled_ids_final = torch.where(unknown_map, sampled_ids_raw, edited_image_tokens)
+
+            # Compute mask ratio for this step
+            ratio = (step + 1) / timesteps
+            # Ensure ratio is a tensor for noise_schedule if needed
+            mask_ratio = noise_schedule(torch.tensor(ratio, device=probs.device))
+
+            # Determine number of tokens to mask
+            # Calculate mask_len based on num_vq_tokens and mask_ratio
+            mask_len_float = num_vq_tokens * mask_ratio
+            # Ensure mask_len is calculated per batch item if unknown_map varies
+            current_unknown = unknown_map.sum(dim=-1, keepdim=True)
+            # Clamp mask_len: max(1, min(floor(mask_len_float), current_unknown - 1))
+            # Use torch.clamp for tensor operations
+            mask_len_tensor = torch.clamp(mask_len_float.floor(), min=1.0)
+            mask_len_tensor = torch.min(mask_len_tensor, torch.clamp(current_unknown - 1, min=0.0)).long()
+
+            # Compute confidence scores for the *raw* sampled tokens (indices 0 to codebook_size-1)
+            # Gather using sampled_ids_raw which has valid indices for probs
+            selected_probs = torch.gather(probs, -1, sampled_ids_raw.unsqueeze(-1)).squeeze(-1)
+            # Ignore known tokens by setting their confidence high
+            selected_probs = torch.where(unknown_map, selected_probs, torch.finfo(probs.dtype).max)
+
+            # Apply masking based on confidence
+            temperature_step = temperature * (1.0 - ratio)
+            # Pass the tensor version of mask_len
+            masking = mask_by_random_topk(mask_len_tensor, selected_probs, temperature_step, generator=generator)
+
+            # Update edited image tokens using the final sampled ids
+            edited_image_tokens = torch.where(masking, mask_token_id, sampled_ids_final)
+
+        # --- Final Processing ---
+        # At the end of the loop, edited_image_tokens contains the generated sequence
+        # with indices relative to the codebook (0 to codebook_size-1) or mask_token_id.
+
+        # Handle any remaining mask tokens. Replacing with 0 is a common strategy.
+        # Ensure the replacement token (e.g., 0) is valid for the VQ decoder.
+        final_edited_tokens = torch.where(
+            edited_image_tokens == mask_token_id,
+            torch.zeros_like(edited_image_tokens), # Replace mask with token 0
+            edited_image_tokens
+        )
+
+        # Ensure all tokens are within the valid range [0, codebook_size - 1]
+        # This prevents out-of-bounds errors if something unexpected happened.
+        final_edited_tokens = torch.clamp(final_edited_tokens, 0, codebook_size - 1)
+
+        # Return *only* the processed edited image tokens (shape: batch_size, num_vq_tokens)
+        return final_edited_tokens
