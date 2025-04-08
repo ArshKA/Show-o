@@ -516,8 +516,8 @@ def main():
                 if global_step % config.experiment.evaluation_interval == 0:
                     logger.info(f"Running evaluation at step {global_step}...")
                     test_loss = evaluate(
-                        model=model, # Pass the prepared model
-                        test_dataloader=test_dataloader, # Pass the prepared test_dataloader
+                        model=model,
+                        test_dataloader=test_dataloader,
                         accelerator=accelerator,
                         uni_prompting=uni_prompting,
                         vq_model=vq_model,
@@ -525,26 +525,26 @@ def main():
                         config=config,
                         mask_schedule=mask_schedule,
                         num_steps=config.experiment.evaluation_steps,
-                        prepare_inputs_and_labels_fn=prepare_inputs_and_labels # Pass the function
+                        prepare_inputs_and_labels_fn=prepare_inputs_and_labels
                     )
                     logger.info(f"Evaluation finished. Test Loss: {test_loss:.4f}")
                     accelerator.log({"test_loss": test_loss}, step=global_step)
 
-                    # Run visualization using the test data loader (vis_dataloader)
-                    # Check visualization interval separately if needed, or keep aligned with evaluation
-                    if global_step % config.experiment.visualization_interval == 0:
-                         logger.info(f"Running visualization at step {global_step}...")
-                         log_visualizations(
-                            model=model, # Pass prepared model
-                            vq_model=vq_model,
-                            vis_dataloader=vis_dataloader, # Use the test-based vis_dataloader
-                            accelerator=accelerator,
-                            uni_prompting=uni_prompting,
-                            config=config,
-                            step=global_step,
-                            num_samples=config.experiment.visualization_samples,
-                         )
-                         logger.info("Visualization finished.")
+                # Run visualization using both train and test dataloaders
+                if global_step % config.experiment.visualization_interval == 0:
+                        logger.info(f"Running visualization at step {global_step}...")
+                        log_visualizations(
+                        model=model,
+                        vq_model=vq_model,
+                        train_dataloader=train_dataloader,  # Pass train dataloader
+                        test_dataloader=vis_dataloader,    # Use the test-based vis_dataloader
+                        accelerator=accelerator,
+                        uni_prompting=uni_prompting,
+                        config=config,
+                        step=global_step,
+                        num_samples=config.experiment.visualization_samples // 2,  # Split samples between train/test
+                        )
+                        logger.info("Visualization finished.")
 
                 # --- Checkpointing --- 
                 if global_step % config.experiment.save_every == 0:

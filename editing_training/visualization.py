@@ -5,13 +5,15 @@ from PIL import Image
 from accelerate.logging import get_logger
 from models import Showo, MAGVITv2, CLIPVisionTower, get_mask_chedule
 from editing_training.prompting_editing import create_attention_mask_predict_next
+from torch.utils.data import DataLoader
 
 logger = get_logger(__name__)
 
 def log_visualizations(
     model,
     vq_model,
-    vis_dataloader,
+    train_dataloader,
+    test_dataloader,
     accelerator,
     uni_prompting,
     config,
@@ -23,14 +25,15 @@ def log_visualizations(
     - Source image
     - Generated edited image
     - Ground truth edited image
+    
+    Clearly separates train and test samples into different sections.
     """
     model.eval()
     unwrapped_model = accelerator.unwrap_model(model)
     mask_token_id = unwrapped_model.mask_token_id
 
-    if True:
-        # Get a visualization batch
-        batch = next(iter(vis_dataloader))
+    # Create a function to process a batch and generate visualizations
+    def process_batch(batch, dataset_type):
         source_images = torch.stack(batch['source_images']).to(accelerator.device)
         edited_images = torch.stack(batch['edited_images']).to(accelerator.device)
         texts = batch['texts']
@@ -95,23 +98,55 @@ def log_visualizations(
             edited_pil = tensor_to_pil(edited_images[i])
             generated_pil = tensor_to_pil(generated_images[i])
 
-            # Create grid with captions
+            # Create grid with captions and dataset type
             wandb_images.append(wandb.Image(
                 source_pil,
-                caption=f"Source: {texts[i]}"
+                caption=f"{dataset_type} Source: {texts[i][:50]}..."
             ))
             wandb_images.append(wandb.Image(
                 generated_pil,
-                caption=f"Generated: {texts[i]}"
+                caption=f"{dataset_type} Generated: {texts[i][:50]}..."
             ))
             wandb_images.append(wandb.Image(
                 edited_pil,
-                caption=f"Ground Truth: {texts[i]}"
+                caption=f"{dataset_type} Ground Truth: {texts[i][:50]}..."
             ))
 
-        accelerator.log({"visualizations": wandb_images}, step=step)
+        return wandb_images
 
-    # except Exception as e:
-    #     logger.error(f"Error in visualization: {e}")
-    # finally:
+    try:
+        # Use dedicated visualization dataloaders for each to ensure
+        # we get unique, representative samples from both
+        train_vis_dataloader = DataLoader(
+            train_dataloader.dataset,
+            batch_size=num_samples,
+            shuffle=True,
+            num_workers=1,
+            collate_fn=train_dataloader.collate_fn
+        ) if train_dataloader else None
+        
+        test_vis_dataloader = test_dataloader if test_dataloader else None
+        
+        # Process train samples
+        train_images = []
+        if train_vis_dataloader:
+            train_batch = next(iter(train_vis_dataloader))
+            train_images = process_batch(train_batch, "TRAIN")
+        
+        # Process test samples
+        test_images = []
+        if test_vis_dataloader:
+            test_batch = next(iter(test_vis_dataloader))
+            test_images = process_batch(test_batch, "TEST")
+        
+        # Log train and test images separately for clear distinction in wandb
+        if train_images:
+            accelerator.log({"train_visualizations": train_images}, step=step)
+        
+        if test_images:
+            accelerator.log({"test_visualizations": test_images}, step=step)
+        
+    except Exception as e:
+        logger.error(f"Error in visualization: {e}")
+    finally:
         model.train()
